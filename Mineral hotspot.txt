@@ -1,0 +1,216 @@
+import ee
+import geemap
+
+# Authenticate and initialize
+ee.Authenticate()
+ee.Initialize(project='Your project name in google earth engine ')
+
+# Define ROI and ROI grid
+roi = ee.FeatureCollection("projects/Your study area wise")
+roi_grids = ee.FeatureCollection("projects/Your Grid area wise file")
+
+# Atmospheric Correction
+def apply_sen2cor(image):
+    scale_factor = 0.0001
+    corrected = image.select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6',
+                              'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']).multiply(scale_factor).toFloat()
+
+    dark_value = corrected.select('B1').reduceRegion(
+        reducer=ee.Reducer.percentile([2]),
+        geometry=roi.geometry(),
+        scale=10,
+        maxPixels=1e9
+    ).get('B1')
+
+    result = corrected.subtract(ee.Image.constant(dark_value)).toFloat()
+    return result.copyProperties(image, ['system:time_start'])
+
+# Load Sentinel-2 and preprocess
+sentinel = ee.ImageCollection("COPERNICUS/S2_SR") \
+    .filterBounds(roi) \
+    .filterDate('2022-01-01', '2022-12-31') \
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)) \
+    .map(apply_sen2cor) \
+    .median() \
+    .clip(roi)
+
+bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']
+sentinel_bands = sentinel.select(bands)
+
+# Vegetation mask
+ndvi = sentinel_bands.normalizedDifference(['B8', 'B4']).rename('NDVI')
+savi = sentinel_bands.expression(
+    '(1 + L) * (NIR - RED) / (NIR + RED + L)',
+    {'NIR': sentinel_bands.select('B8'), 'RED': sentinel_bands.select('B4'), 'L': 0.5}).rename('SAVI')
+vegetation_mask = ndvi.lt(0.2).And(savi.lt(0.1))
+
+# Mineral Indices
+cobalt_index = sentinel_bands.expression('(B2 / B3) * (B12 / B11)', {
+    'B2': sentinel_bands.select('B2'),
+    'B3': sentinel_bands.select('B3'),
+    'B11': sentinel_bands.select('B11'),
+    'B12': sentinel_bands.select('B12')
+}).rename('Cobalt_Index')
+
+iron_index = sentinel_bands.expression('(B4 / B2) * (B11 / B12)', {
+    'B2': sentinel_bands.select('B2'),
+    'B4': sentinel_bands.select('B4'),
+    'B11': sentinel_bands.select('B11'),
+    'B12': sentinel_bands.select('B12')
+}).rename('Iron_Index')
+
+nickel_index = sentinel_bands.expression('(B3 / B4) * (B11 / B8)', {
+    'B3': sentinel_bands.select('B3'),
+    'B4': sentinel_bands.select('B4'),
+    'B8': sentinel_bands.select('B8'),
+    'B11': sentinel_bands.select('B11')
+}).rename('Nickel_Index')
+
+lead_index = sentinel_bands.expression('(B4 / B3) * (B12 / B11)', {
+    'B3': sentinel_bands.select('B3'),
+    'B4': sentinel_bands.select('B4'),
+    'B11': sentinel_bands.select('B11'),
+    'B12': sentinel_bands.select('B12')
+}).rename('Lead_Index')
+
+zinc_index = sentinel_bands.expression('(B2 / B4) * (B11 / B12)', {
+    'B2': sentinel_bands.select('B2'),
+    'B4': sentinel_bands.select('B4'),
+    'B11': sentinel_bands.select('B11'),
+    'B12': sentinel_bands.select('B12')
+}).rename('Zinc_Index')
+
+manganese_index = sentinel_bands.expression('B3 / (B2 + B4)', {
+    'B2': sentinel_bands.select('B2'),
+    'B3': sentinel_bands.select('B3'),
+    'B4': sentinel_bands.select('B4')
+}).rename('Manganese_Index')
+
+copper_index = sentinel_bands.expression('(B2 / B3) * (B4 / B8)', {
+    'B2': sentinel_bands.select('B2'),
+    'B3': sentinel_bands.select('B3'),
+    'B4': sentinel_bands.select('B4'),
+    'B8': sentinel_bands.select('B8')
+}).rename('Copper_Index')
+
+# Terrain Data
+dem = ee.Image("USGS/SRTMGL1_003").clip(roi)
+slope = ee.Terrain.slope(dem).rename('Slope')
+
+# Combine layers
+mineral_image = ee.Image.cat([
+    sentinel_bands,
+    cobalt_index,
+    iron_index,
+    nickel_index,
+    lead_index,
+    zinc_index,
+    manganese_index,
+    copper_index,
+    vegetation_mask.rename('Veg_Mask'),
+    dem.rename('Elevation'),
+    slope
+])
+
+# Hotspot extraction (top 10%)
+def extract_hotspot(mineral_image, band_name, percentile=90):
+    threshold = mineral_image.select(band_name).reduceRegion(
+        reducer=ee.Reducer.percentile([percentile]),
+        geometry=roi.geometry(),
+        scale=30,
+        maxPixels=1e9
+    ).get(band_name)
+
+    mask = mineral_image.select(band_name).gt(threshold)
+    hotspot = mineral_image.select(band_name).updateMask(mask).rename(f'{band_name}_Hotspot')
+    return hotspot
+
+# Create hotspot images for all minerals
+hotspots = {
+    'Copper_Index': extract_hotspot(mineral_image, 'Copper_Index'),
+    'Iron_Index': extract_hotspot(mineral_image, 'Iron_Index'),
+    'Cobalt_Index': extract_hotspot(mineral_image, 'Cobalt_Index'),
+    'Zinc_Index': extract_hotspot(mineral_image, 'Zinc_Index'),
+    'Nickel_Index': extract_hotspot(mineral_image, 'Nickel_Index'),
+    'Lead_Index': extract_hotspot(mineral_image, 'Lead_Index'),
+    'Manganese_Index': extract_hotspot(mineral_image, 'Manganese_Index'),
+}
+
+# Grid-wise stats per mineral hotspot
+def get_hotspot_stats_per_grid(hotspot_image, mineral_name, roi_grids):
+    results = []
+    for feature in roi_grids.getInfo()['features']:
+        grid_id = feature['properties']['Grid']
+        geom = ee.Geometry(feature['geometry'])
+
+        mask = hotspot_image.mask().clip(geom)
+
+        area = mask.multiply(ee.Image.pixelArea()).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=geom,
+            scale=30,
+            maxPixels=1e9
+        ).get(f'{mineral_name}_Hotspot')
+
+        centroid = geom.centroid()
+        lon, lat = centroid.coordinates().getInfo()
+
+        feature = ee.Feature(geom, {
+            'Grid_ID': grid_id,
+            'Mineral': mineral_name.replace('_Index', ''),
+            'Area_m2': area,
+            'Longitude': lon,
+            'Latitude': lat,
+        })
+
+        results.append(feature)
+    return results
+
+# Compile all mineral grid-wise hotspot features
+all_results = []
+for mineral, hotspot_img in hotspots.items():
+    results = get_hotspot_stats_per_grid(hotspot_img, mineral, roi_grids)
+    all_results.extend(results)
+
+hotspot_fc = ee.FeatureCollection(all_results)
+
+
+# Visualization (Optional)
+Map = geemap.Map(center=[-12.5, 31.5], zoom=7)
+Map.addLayer(copper_index, {"min": 0.5, "max": 1.5, "palette": ['blue', 'green', 'yellow', 'red']}, "Copper Index")
+Map.addLayer(cobalt_index, {"min": 0.5, "max": 1.8, "palette": ['blue', 'green', 'yellow', 'red']}, "Cobalt Index")
+Map.addLayer(iron_index, {"min": 1.5, "max": 3.5, "palette": ['blue', 'green', 'yellow', 'red']}, "Iron Index")
+Map.addLayer(nickel_index, {"min": 0.3, "max": 1.0, "palette": ['blue', 'green', 'yellow', 'red']}, "Nickel Index")
+Map.addLayer(lead_index, {"min": 0.6, "max": 2.0, "palette": ['blue', 'green', 'yellow', 'red']}, "Lead Index")
+Map.addLayer(zinc_index, {"min": 1.0, "max": 2.5, "palette": ['blue', 'green', 'yellow', 'red']}, "Zinc Index")
+Map.addLayer(manganese_index, {"min": 0.3, "max": 1.2, "palette": ['blue', 'green', 'yellow', 'red']}, "Manganese Index")
+Map.addLayer(slope, {"min": 0, "max": 45, "palette": ['white', 'yellow', 'orange', 'red']}, "Slope")
+Map.addLayer(dem, {"min": 0, "max": 2500, "palette": ['white', 'blue', 'green', 'yellow', 'red']}, "Elevation")
+Map
+
+## Find there highest indicies value of each indicies
+
+# Function to get max value from an image band over the ROI
+def get_max_value(image, band_name):
+    stat = image.select(band_name).reduceRegion(
+        reducer=ee.Reducer.max(),
+        geometry=roi.geometry(),
+        scale=30,
+        maxPixels=1e9
+    )
+    return stat.get(band_name)
+
+# Get max values of each index
+max_values = {
+    'Copper_Index': get_max_value(copper_index, 'Copper_Index'),
+    'Iron_Index': get_max_value(iron_index, 'Iron_Index'),
+    'Cobalt_Index': get_max_value(cobalt_index, 'Cobalt_Index'),
+    'Zinc_Index': get_max_value(zinc_index, 'Zinc_Index'),
+    'Nickel_Index': get_max_value(nickel_index, 'Nickel_Index'),
+    'Lead_Index': get_max_value(lead_index, 'Lead_Index'),
+    'Manganese_Index': get_max_value(manganese_index, 'Manganese_Index'),
+}
+
+# Print out max values
+for mineral, max_val in max_values.items():
+    print(f"{mineral}: {max_val.getInfo()}")
