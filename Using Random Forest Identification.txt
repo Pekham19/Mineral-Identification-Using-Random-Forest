@@ -1,0 +1,217 @@
+import ee
+import geemap
+
+# Authenticate & Initialize Earth Engine
+ee.Authenticate()
+ee.Initialize(project='Your google earth engine project name')
+
+# Load Region of Interest (ROI)
+roi = ee.FeatureCollection("projects/Your study area in google earth engine name ")
+
+# Load Sentinel-2 Image
+sentinel = ee.ImageCollection("COPERNICUS/S2_SR") \
+    .filterBounds(roi) \
+    .filterDate('2022-01-01', '2022-12-31') \
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)) \
+    .median() \
+    .clip(roi)
+
+# Select Bands
+bands = sentinel.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+
+# --- Vegetation Indices ---
+ndvi = bands.normalizedDifference(['B8', 'B4']).rename('NDVI')
+savi = bands.expression(
+    '((B8 - B4) / (B8 + B4 + 0.5))', {'B8': bands.select('B8'), 'B4': bands.select('B4')}
+).rename('SAVI')
+vegetation_mask = ndvi.gt(0.2).Or(savi.gt(0.2)).rename('Vegetation_Mask')
+
+# --- Mineral Indices ---
+cobalt_index = bands.expression('(B2 / B3) * (B12 / B11)', {
+    'B2': bands.select('B2'),
+    'B3': bands.select('B3'),
+    'B11': bands.select('B11'),
+    'B12': bands.select('B12')
+}).rename('Cobalt_Index')
+
+iron_index = bands.expression('(B4 / B2) * (B11 / B12)', {
+    'B2': bands.select('B2'),
+    'B4': bands.select('B4'),
+    'B11': bands.select('B11'),
+    'B12': bands.select('B12')
+}).rename('Iron_Index')
+
+lead_index = bands.expression('(B4 / B3) * (B12 / B11)', {
+    'B3': bands.select('B3'),
+    'B4': bands.select('B4'),
+    'B11': bands.select('B11'),
+    'B12': bands.select('B12')
+}).rename('Lead_Index')
+
+manganese_index = bands.expression('B3 / (B2 + B4)', {
+    'B2': bands.select('B2'),
+    'B3': bands.select('B3'),
+    'B4': bands.select('B4')
+}).rename('Manganese_Index')
+
+copper_index = bands.expression('(B2 / B3) * (B4 / B8)', {
+    'B2': bands.select('B2'),
+    'B3': bands.select('B3'),
+    'B4': bands.select('B4'),
+    'B8': bands.select('B8')
+}).rename('Copper_Index')
+
+# --- DEM & Terrain ---
+dem = ee.Image("USGS/SRTMGL1_003").clip(roi)
+slope = ee.Terrain.slope(dem).rename('Slope')
+elevation = dem.rename('Elevation')
+
+# --- Stack All Features for Classification ---
+spectral_stack = copper_index \
+    .addBands([iron_index, manganese_index, lead_index, cobalt_index,
+               elevation, slope, vegetation_mask])
+
+# --- Manually Labeled Training Points ---
+training_points = ee.FeatureCollection([
+    ee.Feature(ee.Geometry.Point([27.1258759, -13.3770342]), {'class': 1}),  # Copper
+    ee.Feature(ee.Geometry.Point([27.1214095, -13.3915050]), {'class': 2}),  # Iron
+    ee.Feature(ee.Geometry.Point([27.1256746, -13.3432188]), {'class': 3}),  # Manganese
+    ee.Feature(ee.Geometry.Point([27.1761174, -13.3329559]), {'class': 4}),  # Lead
+    ee.Feature(ee.Geometry.Point([27.1761174, -13.3329559]), {'class': 5}),  # Cobalt
+    ee.Feature(ee.Geometry.Point([27.1805590, -13.3977702]), {'class': 6}),  # Vegetation
+])
+
+# --- Sample Training Data ---
+training = spectral_stack.sampleRegions(
+    collection=training_points,
+    properties=['class'],
+    scale=30,
+    geometries=True
+)
+
+# --- Train Random Forest Classifier ---
+classifier = ee.Classifier.smileRandomForest(100).train(
+    features=training,
+    classProperty='class',
+    inputProperties=spectral_stack.bandNames()
+)
+
+# --- Classify the Image ---
+classified = spectral_stack.classify(classifier).clip(roi)
+
+# --- Calculate Area per Class (in square meters and square kilometers) ---
+area_image = ee.Image.pixelArea().divide(1e6).addBands(classified)
+
+# Reduce the area image to group by mineral class
+area_stats = area_image.reduceRegion(
+    reducer=ee.Reducer.sum().group(1, 'classification'),
+    geometry=roi.geometry(),
+    scale=30,
+    maxPixels=1e13
+)
+
+# --- Area Output ---
+print("Mineral Zone Areas (sq km):")
+area_info = area_stats.getInfo()
+
+# Mapping mineral class to names
+class_dict = {
+    1: 'Copper',
+    2: 'Iron',
+    3: 'Manganese',
+    4: 'Lead',
+    5: 'Cobalt',
+    6: 'Vegetation'
+}
+
+# Print area in square kilometers for each mineral zone
+for group in area_info['groups']:
+    mineral = class_dict.get(group['classification'], 'Unknown')
+    print(f"{mineral} zone: {group['sum']:.2f} sq km")
+
+# --- Visualization ---
+Map = geemap.Map(center=[-13.3, 27.6], zoom=8)
+Map.addLayer(roi, {}, "ROI")
+Map.addLayer(training_points, {"color": "yellow"}, "Training Points")
+Map.addLayer(classified, {
+    "min": 1, "max": 6,
+    "palette": ['red', 'blue', 'white', 'cyan', 'green', 'black']
+}, "Mineral Zones")
+
+# Add Indices & Terrain to Map
+Map.addLayer(cobalt_index, {'min': 0, 'max': 1, 'palette': ['black', 'blue']}, "Cobalt Index")
+Map.addLayer(iron_index, {'min': 0, 'max': 1, 'palette': ['black', 'green']}, "Iron Index")
+Map.addLayer(lead_index, {'min': 0, 'max': 1, 'palette': ['black', 'orange']}, "Lead Index")
+Map.addLayer(manganese_index, {'min': 0, 'max': 1, 'palette': ['black', 'cyan']}, "Manganese Index")
+Map.addLayer(copper_index, {'min': 0, 'max': 1, 'palette': ['black', 'red']}, "Copper Index")
+Map.addLayer(elevation, {'min': 900, 'max': 1500, 'palette': ['white', 'gray', 'black']}, "Elevation")
+Map.addLayer(slope, {'min': 0, 'max': 30, 'palette': ['white', 'brown']}, "Slope")
+Map.addLayer(vegetation_mask, {"palette": ['white', 'green']}, "Vegetation Mask")
+
+Map
+
+## You can download the lat long of each mineral location with there datasets 
+import pandas as pd
+from google.colab import drive
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Step 1: Mask classified image by class and extract points for each class
+def get_points_for_class(class_id, mineral_name, max_points=500):
+    mineral_mask = classified.eq(class_id)
+
+    # Calculate the area of each pixel (in square meters) and divide by 1e6 to convert to square kilometers
+    area_image = ee.Image.pixelArea().divide(1e6)  # Area in square kilometers
+
+    # Add the area band to the mineral_mask
+    area_mask = mineral_mask.addBands(area_image)
+
+    points = area_mask.stratifiedSample(
+        numPoints=max_points,
+        classBand='classification',
+        region=roi.geometry(),
+        scale=30,
+        geometries=True,
+        seed=42
+    )
+
+    # Convert to list of dictionaries (lat, lon, class name, area)
+    features = points.getInfo()['features']
+    data = []
+    for f in features:
+        coords = f['geometry']['coordinates']
+        area = f['properties']['area']  # Get area of each point (in sq km)
+        data.append({
+            'Latitude': coords[1],
+            'Longitude': coords[0],
+            'Mineral': mineral_name,
+            'Area (sq km)': area
+        })
+    return data
+
+# Step 2: Loop over each class and extract points for each mineral
+class_dict = {
+    1: 'Copper',
+    2: 'Iron',
+    3: 'Manganese',
+    4: 'Lead',
+    5: 'Cobalt',
+    6: 'Vegetation'
+}
+
+all_data = []
+for class_id, mineral in class_dict.items():
+    print(f"Extracting for {mineral}...")
+    data = get_points_for_class(class_id, mineral)
+    all_data.extend(data)
+
+# Step 3: Create DataFrame from collected data
+df = pd.DataFrame(all_data)
+
+# Step 4: Save DataFrame to CSV in Google Drive
+output_path = "/content/drive/MyDrive/your location of saving the file "
+df.to_csv(output_path, index=False)
+
+print(f"Data has been saved to {output_path}")
+
